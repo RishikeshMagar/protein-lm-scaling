@@ -17,6 +17,13 @@ from protein_lm.modeling.utils.modules import ContactPredictionHead
 
 logger = logging.get_logger(__name__)
 
+
+class PrefixState():
+    def __init__(self):
+        self.prefix_len_list = None
+prefix_state = PrefixState()
+
+
 class APTAttention(GPT2Attention):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__(config, is_cross_attention=is_cross_attention, layer_idx=layer_idx)
@@ -29,8 +36,7 @@ class APTAttention(GPT2Attention):
             persistent=False,
         )
         self.register_buffer("masked_bias", torch.tensor(-1e4), persistent=False)
-        self.position_embedding = config.position_embedding
-        
+        self.position_embedding = config.position_embedding        
         self.max_sequence_length = config.max_sequence_length
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -84,9 +90,77 @@ class APTAttention(GPT2Attention):
             elif self.position_embedding=="dynamic_rope_scaling":
                 self.rot_emb=LlamaDynamicNTKScalingRotaryEmbedding(dim=self.head_dim,max_position_embeddings=self.max_positions,scaling_factor=self.rope_scaling_factor,base=self.rope_theta)
 
+    def _get_mask_from_prefix_indices(self,attn_shape, prefix_indices, device):
+        batch_size, num_heads, query_len, key_len = attn_shape
+        prefix_mask = torch.zeros((batch_size, num_heads, query_len, key_len), dtype=torch.bool, device=device) # Initialize mask with False
+        for batch_idx, prefix_end_idx in enumerate(prefix_indices):
+            prefix_mask[batch_idx, :, :prefix_end_idx, :prefix_end_idx] = True  # Set masked positions to True
+        return prefix_mask
     
+    def _prefix_LM_attn(self, query, key, value, attention_mask=None, head_mask=None,alibi_bias=None, prefix_lm = None):
+        '''
+        prefix_lm = None for a autoregressive model
+        '''
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))
+        global prefix_state 
+        prefix_indices = prefix_state.prefix_len_list
+
+        #print("prefix_indices",prefix_indices)
+        # exit()
+
+        if prefix_indices is not None:
+            prefix_mask = self._get_mask_from_prefix_indices(attn_weights.shape, prefix_indices, attn_weights.device)
+
+        #print("prefix_mask",prefix_mask)
+
+        if self.scale_attn_weights:
+            attn_weights = attn_weights / torch.full(
+                [], value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
+            )
+
+        # Layer-wise attention scaling
+        if self.scale_attn_by_inverse_layer_idx:
+            attn_weights = attn_weights / float(self.layer_idx + 1)
+
+        if not self.is_cross_attention:
+            # if only "normal" attention layer implements causal mask
+            query_length, key_length = query.size(-2), key.size(-2)
+            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            
+            if prefix_indices is not None:
+                causal_mask = causal_mask + prefix_mask
+                
+            mask_value = torch.finfo(attn_weights.dtype).min
+            # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+            mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+            attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)    
+        
+        if alibi_bias is not None:
+            attn_weights = attn_weights + alibi_bias[:,:,:attn_weights.size(-1)]
+
+        if attention_mask is not None:
+            # Apply the attention mask
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+        # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
+        attn_weights = attn_weights.type(value.dtype)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            attn_weights = attn_weights * head_mask
+
+        attn_output = torch.matmul(attn_weights, value)
+
+        return attn_output, attn_weights        
+
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None,alibi_bias=None):
+
+        # print("query shape:", query.shape)
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
         if self.scale_attn_weights:
@@ -102,14 +176,15 @@ class APTAttention(GPT2Attention):
             # if only "normal" attention layer implements causal mask
             query_length, key_length = query.size(-2), key.size(-2)
             causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            #print("causal",causal_mask)
             mask_value = torch.finfo(attn_weights.dtype).min
             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
             # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
             mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
-            attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+            attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)    
         if alibi_bias is not None:
             attn_weights = attn_weights + alibi_bias[:,:,:attn_weights.size(-1)]
-        
+
         if attention_mask is not None:
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
@@ -279,6 +354,7 @@ class APTAttention(GPT2Attention):
         position_ids: Optional[torch.LongTensor] = None,
 
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
+        
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn"):
                 raise ValueError(
@@ -323,7 +399,7 @@ class APTAttention(GPT2Attention):
             present = (key, value)
         else:
             present = None
-
+        
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias)
         elif self.standard_attn:
@@ -676,7 +752,6 @@ class APTModel(GPT2PreTrainedModel):
             cross_attentions=all_cross_attentions,
         )
 
-    
 """
 The APT Model transformer with a language modeling head on top (linear layer with weights tied to the input
 embeddings).
@@ -700,6 +775,27 @@ class APTLMHeadModel(GPT2PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    ### Integrate only when we want PrefixLM
+    def get_prefix_len_list(self,combined_sequences, eos_token):
+
+        """
+        Assume that we have data in this format:
+        1. <bos> C_1, C_2, ..., C_n <eos> <bos> F_1, F_2, ..., F_m <eos>
+        2. <bos> F_1, F_2, ..., F_m <eos>
+
+        Where C_i is the conditional sequence and F_i is the focus sequence.
+        """
+
+        prefix_end_indices = torch.where(combined_sequences == eos_token)[1] # Find the indices of the <eos> token 
+        prefix_end_indices = prefix_end_indices.view(-1, 2)[:, 0] # Get the first <eos> token (end of the conditional sequence
+        has_conditioning = prefix_end_indices < combined_sequences.size(1) - 1 # identify if the sequence has conditioning
+        prefix_end_indices[~has_conditioning] = 0 # if there is no conditioning, set the prefix to 0
+        # print("prefix_end_indices", prefix_end_indices)
+        # print("prefix_end_indices_shape", prefix_end_indices.shape)
+
+        return torch.LongTensor(prefix_end_indices.tolist())
+    
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -716,6 +812,7 @@ class APTLMHeadModel(GPT2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+
     ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -724,6 +821,10 @@ class APTLMHeadModel(GPT2PreTrainedModel):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        global prefix_state   # Create an instance of the prefix state
+        prefix_len_list = self.get_prefix_len_list(input_ids, 22)
+        prefix_state.prefix_len_list = prefix_len_list
 
         transformer_outputs = self.transformer(
             input_ids,
