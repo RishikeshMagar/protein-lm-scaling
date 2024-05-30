@@ -18,10 +18,6 @@ from protein_lm.modeling.utils.modules import ContactPredictionHead
 logger = logging.get_logger(__name__)
 
 
-class PrefixState():
-    def __init__(self):
-        self.prefix_len_list = None
-prefix_state = PrefixState()
 
 
 class APTAttention(GPT2Attention):
@@ -62,6 +58,8 @@ class APTAttention(GPT2Attention):
             self.reorder_and_upcast_attn = True
         elif self.attn_type == "standard":
             self.standard_attn = True
+        elif self.attn_type == "prefix_LM":
+            self.prefix_LM_attn = True
 
         #self.reorder_and_upcast_attn = config.reorder_and_upcast_attn #comment out because config now states attn type
 
@@ -102,8 +100,9 @@ class APTAttention(GPT2Attention):
         prefix_lm = None for a autoregressive model
         '''
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
-        global prefix_state 
-        prefix_indices = prefix_state.prefix_len_list
+        # global prefix_state 
+        # prefix_indices = prefix_state.prefix_len_list
+        prefix_indices = prefix_lm
 
         #print("prefix_indices",prefix_indices)
         # exit()
@@ -202,6 +201,97 @@ class APTAttention(GPT2Attention):
         attn_output = torch.matmul(attn_weights, value)
 
         return attn_output, attn_weights
+
+    def _prefix_gqa_attn(self, query, key, value, attention_mask=None, 
+                alibi_bias =None, dropout=0.0, prefix_lm = None):
+        """Group Query Attention implementation."""
+        
+        # Check for potential issues before moving on
+        if not query.ndim == key.ndim == value.ndim == 4:
+            raise ValueError(f"Expected query, key, and value to be 4-dimensional, but got shapes "
+                            f"{query.shape}, {key.shape}, and {value.shape}.")
+        
+        """
+        Expected shapes: (batch_size, num_heads, query_len, query_dim) similar to _upcast_and_reordered_attn
+        """
+        batch_size, num_heads, query_len, query_dim = query.shape
+
+
+        scale_factor = 1.0
+        if self.scale_attn_weights:
+            scale_factor /= float(value.size(-1)) ** 0.5
+        query = query / scale_factor
+
+        '''
+        Determine the number of groups
+        For example lets say we have 4 queries heads and 2 keys heads, then we have 2 groups
+        Lets say the number of group are 2 and head are 2, 
+        then reshape the query tensor to (batch_size, (2, 2), query_len, query_dim)
+        query shape (batch_size, num_groups, num_heads, query_len, query_dim)
+        attention_weights_grouped shape (batch_size, num_groups, num_heads, query_len, key_len).
+        attention weights shape: (batch_size, num_heads, query_len, key_len)
+        '''
+
+        n_groups = query.size(1) // key.size(1)
+
+        if n_groups > 1:
+            query_shape = query.shape
+            grouped_shape = (query_shape[0], n_groups, query_shape[1]//n_groups, query_shape[2], query_shape[3])
+            query_grouped = query.reshape(grouped_shape)
+            attn_weights_grouped = torch.matmul(query_grouped, key.transpose(-2, -1))
+            attn_weights = attn_weights_grouped.sum(dim=1)
+            #print("attn_weights:", attn_weights.shape)
+
+        else:
+            '''
+            If the number of groups is 1, then we can use the normal attention function
+            '''
+            attn_weights = torch.matmul(query, key.transpose(-2, -1))
+
+        if self.scale_attn_by_inverse_layer_idx:
+                attn_weights = attn_weights / float(self.layer_idx + 1)
+
+        if attention_mask is not None:
+            # Apply the attention mask
+            '''
+            Input attention_mask shape: (batch_size, query_len, key_len)
+            '''
+            attn_weights += attention_mask.unsqueeze(1)  # Unsqueeze to Add head dimension
+
+
+        prefix_indices = prefix_lm
+
+        #print("prefix_indices",prefix_indices)
+        # exit()
+
+        if prefix_indices is not None:
+            prefix_mask = self._get_mask_from_prefix_indices(attn_weights.shape, prefix_indices, attn_weights.device)
+        # Causal masking ensures that the attention mechanism doesn't attend to "future" tokens in sequences.
+        ## Adapted to work with groups and ensure similarity with vanilla attention
+        if not self.is_cross_attention:
+            query_length, key_length = query.size(-2), key.size(-2)
+            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            mask_value = torch.finfo(attn_weights.dtype).min
+            causal_mask = causal_mask + prefix_mask
+            mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+            attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+
+            # print("attn_weights:", attn_weights)
+        # Softmax normalization to get the attention scores
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        
+        if alibi_bias is not None:
+            attn_weights = attn_weights + alibi_bias[:,:,:attn_weights.size(-1)]
+
+        # Apply dropout if specified
+        attn_weights = attn_weights.type(value.dtype)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Compute the output by multiplying the attention scores with the value tensor.
+        attn_output = torch.matmul(attn_weights, value)
+        
+        return attn_output, attn_weights
+
 
     def _gqa_attn(self, query, key, value, attention_mask=None, 
                 alibi_bias =None, dropout=0.0):
@@ -352,6 +442,7 @@ class APTAttention(GPT2Attention):
         output_attentions: Optional[bool] = False,
         alibi_bias: Optional[Tuple[torch.Tensor]] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        prefix_len_list: Optional[int] = None,
 
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
         
@@ -375,7 +466,9 @@ class APTAttention(GPT2Attention):
         kv_seq_len=key.shape[-2]
         if layer_past is not None:
             kv_seq_len+=layer_past[0].shape[-2]
-      
+
+        print("prefix_len_list",prefix_len_list)
+        # print("Is the prefix liost here?", prefix_len_list)
         # Apply rope embedding to query and key
         if self.rot_emb:
             bsz, q_len, _ = hidden_states.size()
@@ -403,9 +496,12 @@ class APTAttention(GPT2Attention):
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias)
         elif self.standard_attn:
-            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias)
+            # attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias)
+            attn_output, attn_weights = self._prefix_LM_attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias, prefix_lm = prefix_len_list)
         elif self.gqa_attn:
             attn_output, attn_weights = self._gqa_attn(query, key, value, attention_mask,alibi_bias=alibi_bias)
+        elif self.prefix_LM_attn:
+            attn_output, attn_weights = self._prefix_LM_attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias, prefix_lm = prefix_len_list)
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
@@ -462,6 +558,7 @@ class APTBlock(nn.Module):
         output_attentions: Optional[bool] = False,
         alibi_bias: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        prefix_len_list: Optional[int] = None,
 
     ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
         residual = hidden_states
@@ -475,6 +572,7 @@ class APTBlock(nn.Module):
             output_attentions=output_attentions,
             alibi_bias=alibi_bias,
             position_ids=position_ids,
+            prefix_len_list=prefix_len_list
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
@@ -565,6 +663,7 @@ class APTModel(GPT2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        prefix_len_list: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -712,7 +811,8 @@ class APTModel(GPT2PreTrainedModel):
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                     alibi_bias=self.alibi if hasattr(self, "alibi") else None,
-                    position_ids=position_ids
+                    position_ids=position_ids,
+                    prefix_len_list=prefix_len_list
                 )
 
             hidden_states = outputs[0]
@@ -786,8 +886,9 @@ class APTLMHeadModel(GPT2PreTrainedModel):
 
         Where C_i is the conditional sequence and F_i is the focus sequence.
         """
-
+        print("combined_sequences", combined_sequences.shape)
         prefix_end_indices = torch.where(combined_sequences == eos_token)[1] # Find the indices of the <eos> token 
+        print("prefix_end_indices", prefix_end_indices)
         prefix_end_indices = prefix_end_indices.view(-1, 2)[:, 0] # Get the first <eos> token (end of the conditional sequence
         has_conditioning = prefix_end_indices < combined_sequences.size(1) - 1 # identify if the sequence has conditioning
         prefix_end_indices[~has_conditioning] = 0 # if there is no conditioning, set the prefix to 0
@@ -821,10 +922,10 @@ class APTLMHeadModel(GPT2PreTrainedModel):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        global prefix_state   # Create an instance of the prefix state
+        # print("input_ids", input_ids.shape)
+        # global prefix_state   # Create an instance of the prefix state
         prefix_len_list = self.get_prefix_len_list(input_ids, 22)
-        prefix_state.prefix_len_list = prefix_len_list
+        # prefix_state.prefix_len_list = prefix_len_list
 
         transformer_outputs = self.transformer(
             input_ids,
@@ -840,6 +941,7 @@ class APTLMHeadModel(GPT2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            prefix_len_list=prefix_len_list
         )
         hidden_states = transformer_outputs[0]
 
