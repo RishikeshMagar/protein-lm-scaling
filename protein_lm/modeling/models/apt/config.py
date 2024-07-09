@@ -11,7 +11,7 @@ class APTConfig(GPT2Config):
         position_embedding: Literal["alibi", "learned", "rope", "rerope", "linear_rope_scaling", "dynamic_rope_scaling"]="learned",
         tokenizer=None,
         max_sequence_length = 1024,
-        attn_type="standard",
+        attn_type="prefix_LM",
         **kwargs
     ):
         super().__init__(**kwargs)

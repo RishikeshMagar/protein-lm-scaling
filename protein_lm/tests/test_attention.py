@@ -81,6 +81,13 @@ def test_gqa_attn():
     assert attn_weights.shape == (batch_size, num_heads, seq_length, seq_length)
     print("Test passed!")
 
+def test_alibi_attn():
+    pass
+
+
+
+
+
 
 test_gqa_attn()
 test_vanilla_attn()

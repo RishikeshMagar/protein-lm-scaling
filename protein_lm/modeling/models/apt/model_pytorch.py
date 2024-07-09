@@ -17,9 +17,6 @@ from protein_lm.modeling.utils.modules import ContactPredictionHead
 
 logger = logging.get_logger(__name__)
 
-
-
-
 class APTAttention(GPT2Attention):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__(config, is_cross_attention=is_cross_attention, layer_idx=layer_idx)
@@ -51,6 +48,11 @@ class APTAttention(GPT2Attention):
         # Layer-wise attention scaling, reordering, and upcasting
         self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
         self.layer_idx = layer_idx
+        
+        self.reorder_and_upcast_attn = False  ## To correct the faulty logic in the code in the attn execution
+        self.gqa_attn = False                 
+        self.prefix_LM_attn = False
+        self.standard_attn = False
 
         if self.attn_type == "gqa":
             self.gqa_attn = True
@@ -61,6 +63,7 @@ class APTAttention(GPT2Attention):
         elif self.attn_type == "prefix_LM":
             self.prefix_LM_attn = True
 
+        # print("attn_type"*50,self.attn_type)
         #self.reorder_and_upcast_attn = config.reorder_and_upcast_attn #comment out because config now states attn type
 
         if self.is_cross_attention:
@@ -100,8 +103,6 @@ class APTAttention(GPT2Attention):
         prefix_lm = None for a autoregressive model
         '''
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
-        # global prefix_state 
-        # prefix_indices = prefix_state.prefix_len_list
         prefix_indices = prefix_lm
 
         #print("prefix_indices",prefix_indices)
@@ -110,7 +111,7 @@ class APTAttention(GPT2Attention):
         if prefix_indices is not None:
             prefix_mask = self._get_mask_from_prefix_indices(attn_weights.shape, prefix_indices, attn_weights.device)
 
-        #print("prefix_mask",prefix_mask)
+        print("prefix_mask",prefix_mask)
 
         if self.scale_attn_weights:
             attn_weights = attn_weights / torch.full(
@@ -467,7 +468,7 @@ class APTAttention(GPT2Attention):
         if layer_past is not None:
             kv_seq_len+=layer_past[0].shape[-2]
 
-        print("prefix_len_list",prefix_len_list)
+        # print("prefix_len_list",prefix_len_list)
         # print("Is the prefix liost here?", prefix_len_list)
         # Apply rope embedding to query and key
         if self.rot_emb:
@@ -492,16 +493,18 @@ class APTAttention(GPT2Attention):
             present = (key, value)
         else:
             present = None
-        
+
+
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias)
         elif self.standard_attn:
-            # attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias)
+            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias)
+        elif self.prefix_LM_attn:
             attn_output, attn_weights = self._prefix_LM_attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias, prefix_lm = prefix_len_list)
         elif self.gqa_attn:
             attn_output, attn_weights = self._gqa_attn(query, key, value, attention_mask,alibi_bias=alibi_bias)
-        elif self.prefix_LM_attn:
-            attn_output, attn_weights = self._prefix_LM_attn(query, key, value, attention_mask, head_mask,alibi_bias=alibi_bias, prefix_lm = prefix_len_list)
+
+
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
@@ -888,7 +891,8 @@ class APTLMHeadModel(GPT2PreTrainedModel):
         """
         print("combined_sequences", combined_sequences.shape)
         prefix_end_indices = torch.where(combined_sequences == eos_token)[1] # Find the indices of the <eos> token 
-        print("prefix_end_indices", prefix_end_indices)
+        # print("prefix_end_indices", prefix_end_indices)
+        print("prefix_end_indices_shape", prefix_end_indices)
         prefix_end_indices = prefix_end_indices.view(-1, 2)[:, 0] # Get the first <eos> token (end of the conditional sequence
         has_conditioning = prefix_end_indices < combined_sequences.size(1) - 1 # identify if the sequence has conditioning
         prefix_end_indices[~has_conditioning] = 0 # if there is no conditioning, set the prefix to 0
@@ -924,7 +928,8 @@ class APTLMHeadModel(GPT2PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # print("input_ids", input_ids.shape)
         # global prefix_state   # Create an instance of the prefix state
-        prefix_len_list = self.get_prefix_len_list(input_ids, 22)
+        prefix_len_list = self.get_prefix_len_list(input_ids, 2)#####??????? Hardcoded here please make the change
+        print("prefix_len_list", prefix_len_list)
         # prefix_state.prefix_len_list = prefix_len_list
 
         transformer_outputs = self.transformer(
