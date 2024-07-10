@@ -92,6 +92,12 @@ class APTAttention(GPT2Attention):
                 self.rot_emb=LlamaDynamicNTKScalingRotaryEmbedding(dim=self.head_dim,max_position_embeddings=self.max_positions,scaling_factor=self.rope_scaling_factor,base=self.rope_theta)
 
     def _get_mask_from_prefix_indices(self,attn_shape, prefix_indices, device):
+        '''
+        Used to get the mask from the prefix indices 
+        For example if the prefix index for a sample is 2 and the seqlen is 5, 
+        then the mask will be: [Mask, Mask, No Mask, No Mask, No Mask]
+        '''
+
         batch_size, num_heads, query_len, key_len = attn_shape
         prefix_mask = torch.zeros((batch_size, num_heads, query_len, key_len), dtype=torch.bool, device=device) # Initialize mask with False
         for batch_idx, prefix_end_idx in enumerate(prefix_indices):
@@ -100,7 +106,9 @@ class APTAttention(GPT2Attention):
     
     def _prefix_LM_attn(self, query, key, value, attention_mask=None, head_mask=None,alibi_bias=None, prefix_lm = None):
         '''
-        prefix_lm = None for a autoregressive model
+        prefix_lm = None for a standard autoregressive model
+        The logic is similar to the _attn function but with the addition of the prefix_lm parameter
+        The model is able to attend to he prefix part
         '''
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
         prefix_indices = prefix_lm
@@ -111,7 +119,7 @@ class APTAttention(GPT2Attention):
         if prefix_indices is not None:
             prefix_mask = self._get_mask_from_prefix_indices(attn_weights.shape, prefix_indices, attn_weights.device)
 
-        print("prefix_mask",prefix_mask)
+        # print("prefix_mask",prefix_mask)
 
         if self.scale_attn_weights:
             attn_weights = attn_weights / torch.full(
@@ -160,6 +168,10 @@ class APTAttention(GPT2Attention):
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None,alibi_bias=None):
 
+        '''
+        Vanilla Attention Block 
+        '''
+
         # print("query shape:", query.shape)
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
@@ -205,7 +217,8 @@ class APTAttention(GPT2Attention):
 
     def _prefix_gqa_attn(self, query, key, value, attention_mask=None, 
                 alibi_bias =None, dropout=0.0, prefix_lm = None):
-        """Group Query Attention implementation."""
+        
+        """Group Query Attention implementation with the Prefix LM part """
         
         # Check for potential issues before moving on
         if not query.ndim == key.ndim == value.ndim == 4:
@@ -262,9 +275,6 @@ class APTAttention(GPT2Attention):
 
         prefix_indices = prefix_lm
 
-        #print("prefix_indices",prefix_indices)
-        # exit()
-
         if prefix_indices is not None:
             prefix_mask = self._get_mask_from_prefix_indices(attn_weights.shape, prefix_indices, attn_weights.device)
         # Causal masking ensures that the attention mechanism doesn't attend to "future" tokens in sequences.
@@ -296,6 +306,7 @@ class APTAttention(GPT2Attention):
 
     def _gqa_attn(self, query, key, value, attention_mask=None, 
                 alibi_bias =None, dropout=0.0):
+        
         """Group Query Attention implementation."""
         
         # Check for potential issues before moving on
@@ -391,8 +402,10 @@ class APTAttention(GPT2Attention):
         if self.scale_attn_by_inverse_layer_idx:
             scale_factor /= float(self.layer_idx + 1)
 
+
+        ###### ?????????????????????? Not entirel sure if we plan to use this ask @Pascal
         # Upcast (turn off autocast) and reorder (Scale K by 1 / root(dk))
-        with autocast(enabled=False):
+        with torch.autocast(enabled=False, device_type=query.device): #### This does not run with CPU
             q, k = query.reshape(-1, q_seq_len, dk), key.transpose(-1, -2).reshape(-1, dk, k_seq_len)
             attn_weights = torch.baddbmm(attn_weights, q.float(), k.float(), beta=0, alpha=scale_factor)
             attn_weights = attn_weights.reshape(bsz, num_heads, q_seq_len, k_seq_len)
@@ -889,10 +902,10 @@ class APTLMHeadModel(GPT2PreTrainedModel):
 
         Where C_i is the conditional sequence and F_i is the focus sequence.
         """
-        print("combined_sequences", combined_sequences.shape)
+        # sprint("combined_sequences", combined_sequences.shape)
         prefix_end_indices = torch.where(combined_sequences == eos_token)[1] # Find the indices of the <eos> token 
         # print("prefix_end_indices", prefix_end_indices)
-        print("prefix_end_indices_shape", prefix_end_indices)
+        # print("prefix_end_indices_shape", prefix_end_indices)
         prefix_end_indices = prefix_end_indices.view(-1, 2)[:, 0] # Get the first <eos> token (end of the conditional sequence
         has_conditioning = prefix_end_indices < combined_sequences.size(1) - 1 # identify if the sequence has conditioning
         prefix_end_indices[~has_conditioning] = 0 # if there is no conditioning, set the prefix to 0
@@ -926,11 +939,7 @@ class APTLMHeadModel(GPT2PreTrainedModel):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        # print("input_ids", input_ids.shape)
-        # global prefix_state   # Create an instance of the prefix state
         prefix_len_list = self.get_prefix_len_list(input_ids, 2)#####??????? Hardcoded here please make the change
-        print("prefix_len_list", prefix_len_list)
-        # prefix_state.prefix_len_list = prefix_len_list
 
         transformer_outputs = self.transformer(
             input_ids,

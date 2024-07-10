@@ -83,9 +83,6 @@ if __name__ == "__main__":
     dataset_path = '/nfs/ssd01/home/rmagar/protein-lm-scaling/protein_lm/dataset/colabfold/output/'
     cluster_table_path = '/nfs/ssd01/home/rmagar/protein-lm-scaling/protein_lm/dataset/colabfold/cluster_sizes.csv'
     dataset = PairedDataset(dataset_path, cluster_table_path, subsample_size=3, val_size=1, test_size=1)
-    # print('len(dataset):',len(dataset))
-    # print('dataset[0]:',dataset[0])
-    # print(type(dataset))
 
     for i, data in enumerate(dataset):
         # print(i, data)

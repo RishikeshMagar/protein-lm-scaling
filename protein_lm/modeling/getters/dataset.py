@@ -12,10 +12,10 @@ class DatasetConfig(BaseModel):
     dataset_type: Literal["csv", "huggingface","colabfold","paired"]
 
     # The path if local or the huggingface dataset name if huggingface
-    dataset_loc: str
+    dataset_path: str
 
     #This is cluster_table for ClusterDataset when dataset_type is colabfold
-    cluster_loc: Optional[str] = None
+    cluster_path: Optional[str] = None
 
     # sample size to limit to, if any, usually for debugging
     subsample_size: Optional[int] = None
@@ -156,12 +156,12 @@ def train_val_test_split(
 
 def get_csv_dataset(config: DatasetConfig) -> Dataset:
     # note that a csv is read as having just one split "train"
-    dataset_dict = load_dataset("csv", data_files=config.dataset_loc)
+    dataset_dict = load_dataset("csv", data_files=config.dataset_path)
     return train_val_test_split(dataset_dict, config)
 
 
 def get_huggingface_dataset(config: DatasetConfig) -> Dataset:
-    dataset_dict = load_dataset(config.dataset_loc)
+    dataset_dict = load_dataset(config.dataset_path)
     if set(dataset_dict.keys()) == {"train", "val", "test"}:
         return dataset_dict
 
@@ -173,12 +173,12 @@ def get_huggingface_dataset(config: DatasetConfig) -> Dataset:
     return train_val_test_split(dataset_dict, config)
 
 def get_colabfold_dataset(config:DatasetConfig) -> Dataset:
-    ds = ClusterDataset(dataset_path = config.dataset_loc, cluster_table_path = config.cluster_loc,subsample_size=config.subsample_size,val_size = config.val_size,test_size = config.test_size)
+    ds = ClusterDataset(dataset_path = config.dataset_path, cluster_table_path = config.cluster_path,subsample_size=config.subsample_size,val_size = config.val_size,test_size = config.test_size)
     ds = DatasetDict({"train":  Dataset.from_generator(ds.__iter__,gen_kwargs={"split": "train"}),"test": Dataset.from_generator(ds.__iter__,gen_kwargs={"split": "test"}),"val":Dataset.from_generator(ds.__iter__,gen_kwargs={"split": "val"})})
     return ds
 
 def get_paired_dataset(config:DatasetConfig) -> Dataset:
-    ds = PairedDataset(dataset_path = config.dataset_loc, cluster_table_path = config.cluster_loc,subsample_size=config.subsample_size,val_size = config.val_size,test_size = config.test_size)
+    ds = PairedDataset(dataset_path = config.dataset_path, cluster_table_path = config.cluster_path,subsample_size=config.subsample_size,val_size = config.val_size,test_size = config.test_size)
     ds = DatasetDict({"train":  Dataset.from_generator(ds.__iter__,gen_kwargs={"split": "train"}),"test": Dataset.from_generator(ds.__iter__,gen_kwargs={"split": "test"}),"val":Dataset.from_generator(ds.__iter__,gen_kwargs={"split": "val"})})
     return ds
 
