@@ -8,6 +8,10 @@ from protein_lm.dataset.cluster_dataset import ClusterDataset
 from protein_lm.dataset.paired_dataset import PairedDataset
 import torch
 
+'''
+Functin argument minor changed to ensure consistency 
+'''
+
 class DatasetConfig(BaseModel):
     dataset_type: Literal["csv", "huggingface","colabfold","paired"]
 
